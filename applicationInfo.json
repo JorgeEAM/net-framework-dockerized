@@ -1,0 +1,28 @@
+[
+	{
+		"IISiteServer": {
+			name: "nombre",
+			physicalpath: "/",
+			features: {
+				enabletracing: true,
+				propiedadTexto: "asdfasda"
+            }
+		},
+		"IISitePool": {
+			name: "nombre",
+			managedRuntime: "v2.0",
+			features: {
+				enabletracing: true,
+				propiedadTexto: "asdfasda"
+            }
+		},
+		"IISiteApp": {
+			name: "nombre",
+			physicalpath: "/",
+			features: {
+				enabletracing: true,
+				propiedadTexto: "asdfasda"
+            }
+		}
+	}
+]
