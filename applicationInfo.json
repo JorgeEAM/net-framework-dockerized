@@ -26,3 +26,8 @@
 		}
 	}
 ]
+
+DISM /Online /Quiet /Add-Package /PackagePath:.\microsoft-windows-netfx3-ondemand-package~31bf3856ad364e35~amd64~~.cab
+Install-WindowsFeature NET-Framework-45-ASPNET
+Install-WindowsFeature Web-Net-Ext
+Install-WindowsFeature Web-Asp-Net 
