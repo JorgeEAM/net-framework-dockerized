@@ -1,0 +1,284 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.Release.Name }}-scripts-cm
+  namespace: {{ .Values.Release.Namespace }}
+data:
+  RunUpServer.ps1: |
+    $stopwatch =  [system.diagnostics.stopwatch]::StartNew();
+    $applicationInfo=Get-Content "C:\config\applicationInfo.json" | ConvertFrom-Json;
+    Set-Location "C:\scripts";
+    .\ConfigureServer.ps1 $applicationInfo;
+    Set-Location "C:\scripts";
+    .\DeployApplication.ps1 $applicationInfo;
+    $stopwatch.Stop();
+    Write-Host -ForegroundColor White -BackgroundColor Green "Server configured and application deployed in: $($stopwatch.Elapsed.ToString('dd\.hh\:mm\:ss'))";
+    C:\ServiceMonitor.exe "w3svc";
+    
+  ConfigureServer.ps1: |
+    param ([Parameter(Mandatory)] $applicationInfo)
+    Write-Host "Configuring server...";
+    .\EnableNETcompatibility.ps1 $applicationInfo.NetVersion;
+    $tasks = $applicationInfo.Tasks;
+    if ($tasks.Contains("Create-Logs-Folder")) { .\CreateLogsFolder.ps1; }
+    if ($tasks.Contains("Install-Powershell-Core")) { .\InstallPwshCore.ps1; }
+    if ($tasks.Contains("Install-Certificates")) { .\InstallCertificates.ps1; }
+    if ($tasks.Contains("Install-Datadog-Client")) { .\InstallDataDogClient.ps1; }
+    if ($tasks.Contains("Install-Oracle-Client")) { .\InstallOracleClient.ps1; }
+    foreach ($file in $applicationInfo.MoveFilesToPath) {
+        Write-Host "Moving files from config directory..." ;
+        Get-Content -Path "C:\config\$($file.File)" > "$($file.Path)$($file.File)";
+    }
+    Write-Output "Server configured.";
+    
+  CreateLogsFolder.ps1: |
+    Write-Output "Creating logs folder...";
+    $env:logs_home="C:\logs"
+    New-Item -Path ${env:LOGS_HOME} -ItemType Directory -Force; 
+    Push-Location ${env:LOGS_HOME}; 
+    $acl = Get-Acl .; 
+    $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new( 
+        'Everyone', 
+        [System.Security.AccessControl.FileSystemRights]::FullControl, 
+        'ContainerInherit,ObjectInherit', 
+        [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow 
+    ); 
+    $acl.AddAccessRule($accessRule); 
+    Set-Acl . $acl; 
+    Get-Acl .;
+    Set-Location "C:\scripts";
+    Write-Output "Logs folder created.";
+    
+  DeployApplication.ps1: |
+    param ([Parameter(Mandatory)] $info)
+    Write-Output "Deploying application...";
+    $env:path = "${env:path};C:\Windows\System32\inetsrv";
+    <#
+        Remove default web site content.
+    #>
+    #Remove-Website -Name 'Default Web Site';
+    Remove-Item -Recurse -Force C:\inetpub\wwwroot\*;
+    Expand-Archive -Path "C:\source\Application.zip" -DestinationPath "C:\source\code"
+    Write-Host $env:path;
+    Get-ChildItem -Path "C:\source\code\"
+    Get-ChildItem -Path "C:\source\code\$($info.ApplicationSourcePath)\*" | Move-Item -Destination "C:\inetpub\wwwroot\$($info.ApplicationName)\" -WhatIf;
+    Get-ChildItem -Path "C:\source\code\$($info.ApplicationSourcePath)\*" | Move-Item -Destination "C:\inetpub\wwwroot\$($info.ApplicationName)";
+    <#
+        Creating WebSite and Application configuration. 
+    #>
+    # AppPool Creation
+    Write-Host "Creating Application Pool";
+    appcmd add apppool /name:$($info.IISitePool.name) /managedRuntimeVersion:$($info.IISitePool.managedRuntimeVersion) /managedPipelineMode:$($info.IISitePool.managedPipelineMode)
+    # Setting features
+    $info.IISitePool.features | ForEach-Object {
+        appcmd set apppool "$($info.IISitePool.name)" /$($_.PSObject.Properties.Name):$($_.PSObject.Properties.Value)
+    }
+    # Site Creation
+    #appcmd add site /name:$($info.IISiteServer.name) /physicalPath:$($info.IISiteServer.physicalpath) /bindings:$($info.IISiteServer.bindings)
+    # Setting features
+    Write-Host "Setting Site Features";
+    $info.IISiteServer.features | ForEach-Object {
+        appcmd set site "$($info.IISiteServer.name)" /$($_.PSObject.Properties.Name):$($_.PSObject.Properties.Value)
+    }
+    # VirtualApp Creation
+    Write-Host "Creating Application";
+    Write-Host "appcmd add app /site.name:$($info.IISiteServer.name) /path:/$($info.ApplicationName) /physicalPath:\"C:\inetpub\wwwroot\$($info.ApplicationName)""
+    appcmd add app /site.name:"Default Web Site" /path:/$($info.ApplicationName) /physicalPath:"C:\inetpub\wwwroot\$($info.ApplicationName)"
+    # Setting relation between VirtualApp and AppPool
+    Write-Host "Setting Application Pool";
+    Write-Host "appcmd set app "Default Web Site/$($info.ApplicationName)" /applicationPool:"$($info.IISitePool.name)""
+    appcmd set app "Default Web Site/$($info.ApplicationName)" /applicationPool:"$($info.IISitePool.name)"
+    # Setting features
+    Write-Host "Setting Application Features";
+    $info.IISiteApp.features | ForEach-Object {
+        Write-Host "appcmd set app "Default Web Site/$($info.ApplicationName)" /$($_.PSObject.Properties.Name):$($_.PSObject.Properties.Value)"
+        appcmd set app "Default Web Site/$($info.ApplicationName)" /$($_.PSObject.Properties.Name):$($_.PSObject.Properties.Value)
+    }
+    appcmd stop apppool /apppool.name:$($info.IISitePool.name)
+    appcmd start apppool /apppool.name:$($info.IISitePool.name)
+    appcmd list apppool /apppool.name:$($info.IISitePool.name)
+    Write-Output "Application deployed.";
+    
+  EnableNETcompatibility.ps1: |
+    <#
+        Enable .NET Framework Compatibility
+    #>
+    Write-Host "Enabling .NET Compatibility..."
+    ##### .NET 3.5
+    if ($applicationInfo.NetVersion -eq "2.0")
+    {    
+        Write-Host "Enabling .NET 2.0 Compatibility..."
+        Write-Host "Installing Web-App-Dev";
+        Install-WindowsFeature Web-App-Dev;
+        Write-Host "Installing Web-ISAPI-Ext";
+        Install-WindowsFeature Web-ISAPI-Ext;
+        Write-Host "Installing Web-ISAPI-Filt";
+        Install-WindowsFeature Web-ISAPI-Filter;
+        #Write-Host "Installing NET-Framework-Features";
+        #Install-WindowsFeature NET-Framework-Features;
+        Write-Host "Installing NetFx3 Support";
+        DISM /Online /Quiet /Add-Package /PackagePath:C:\Source\Fx3\microsoft-windows-netfx3-ondemand-package~31bf3856ad364e35~amd64~~.cab 
+        Write-Host "Installing NET-Framework-45-ASPNET";
+        Install-WindowsFeature NET-Framework-45-ASPNET;
+        Write-Host "Installing Web-Net-Ext";
+        Install-WindowsFeature Web-Net-Ext;
+        Write-Host "Installing Web-Asp-Net";
+        Install-WindowsFeature Web-Asp-Net;
+        #Install-WindowsFeature Web-ISAPI-Filter -IncludeAllSubFeature;
+        #Install-WindowsFeature Web-ISAPI-Ext -IncludeAllSubFeature;
+        #Install-WindowsFeature NET-Framework-45-ASPNET -IncludeAllSubFeature;
+        #Install-WindowsFeature Web-Asp-Net -IncludeAllSubFeature;
+        #Install-WindowsFeature Web-Net-Ext -IncludeAllSubFeature;
+        #Install-WindowsFeature NET-Framework-Core -IncludeAllSubFeature;
+        #Install-WindowsFeature NET-Framework-45-Core -IncludeAllSubFeature;  Installed with NetFramework45
+        #Install-WindowsFeature NET-WCF-TCP-PortSharing -IncludeAllSubFeature; 
+        Exit 0;
+    }
+    ##### .NET 4.x
+    elseif($applicationInfo.NetVersion -eq "4.0") {
+        Write-Host "Enabling .NET 4.0 Compatibility..."
+        Install-WindowsFeature NET-Framework-Features
+        Install-WindowsFeature NET-Framework-Core
+        Install-WindowsFeature NET-Framework-45-Features
+        Install-WindowsFeature NET-Framework-45-Core
+        Install-WindowsFeature NET-Framework-45-ASPNET
+        Install-WindowsFeature NET-WCF-Services45
+        Install-WindowsFeature NET-TCP-Portsharing
+        Install-WindowsFeature Web-Server
+        Install-WindowsFeature Web-WebServer
+        Install-WindowsFeature Web-Security
+        Install-WindowsFeature Web-Filtering
+        Install-WindowsFeature Web-Common-Http
+        Install-WindowsFeature Web-Default-Doc
+        Install-WindowsFeature Web-App-Dev
+        Install-WindowsFeature Web-Net-Ext45
+        Install-WindowsFeature Web-Asp-Net45
+        #Install-WindowsFeature Web-Asp-Net45 -IncludeAllSubFeature;
+        #Install-WindowsFeature Web-Net-Ext45 -IncludeAllSubFeature;
+        #Install-WindowsFeature NET-Framework-45-Core -IncludeAllSubFeature;
+        #Install-WindowsFeature NET-Framework-45-ASPNET -IncludeAllSubFeature;
+        #Install-WindowsFeature NET-WCF-TCP-PortSharing -IncludeAllSubFeature;     
+        Exit 0;
+    }
+    ##### .NET Version not found
+    else {
+        Exit -1;
+    }
+    Write-Host ".NET Compatibility enabled."
+    
+  InstallCertificates.ps1: |
+    Write-Host "Installing certificates...";
+    <#
+        Install CA Root certificates
+    #>
+    Push-Location "C:\certs";
+    [array]$certsArtifacts = Get-ChildItem -File;
+    foreach ($certsArtifact in $certsArtifacts) {
+        $destinationPath = [System.IO.Path]::Combine("C:\certs", 'current');
+        Write-Output ${destinationPath};
+        Write-Host ${destinationPath};
+        Expand-Archive -Path ${certsArtifact} -DestinationPath ${destinationPath};
+        $cert = Get-ChildItem -Path ${destinationPath} -File;
+        $certPath = [System.IO.Path]::Combine($destinationPath, $cert.name);
+        Push-Location -Path Cert:\LocalMachine\Root\;
+        Import-Certificate -FilePath $certPath;
+        Pop-Location;
+        Write-Output ${destinationPath};
+        Remove-Item -Path ${destinationPath} -Recurse -Force;
+    }
+    [System.IO.Path]::Combine("C:\certs", '..') | Resolve-Path | Push-Location;
+    [System.IO.Path]::Combine("C:\certs", '*') | Remove-Item -Recurse -Force;
+    Set-Location C:\scripts;
+    Write-Host "Certificates installed.";
+    
+  InstallDataDogClient.ps1: |
+    Write-Host 'Installing Datadog .NET Tracer';
+    Push-location C:\temp\temp_apm;
+    Start-Process -Wait msiexec -ArgumentList '/i datadog-apm.msi /quiet /qn /norestart /log datadog-apm-msi-installer.log';
+    Write-Host "Datadog .NET Tracer install process FINISHED.";
+    Write-Host "Printing installation logs...";
+    Get-Content "datadog-apm-msi-installer.log";
+    Write-Host 'Removing installer files...';
+    #Remove-Item ${env:APM_TEMP} -Recurse -Force;
+    #Write-Host 'Installer files REMOVED.';
+    Pop-Location;
+    
+  InstallOracleClient.ps1: |
+    Write-Host "Installing Oracle Client...";
+    ######################################################
+    # INSTALL ORACLE DATA ACCESS COMPONENTS 19.3 (32bit) #
+    ######################################################
+    #$env:ORACLE_CLIENT_ZIP_FILE_LOCATION="https://nexusmaster.alm.europe.cloudcenter.corp/repository/scq-3rd-party-raw/oracle/database/oracle19c/windows/client/193000/"
+    $env:ORACLE_TEMP="c:\temp\oracle"
+    #$env:ORACLE_TEMP_CLIENT=Join-Path $env:ORACLE_TEMP "\client32"
+    $env:ORACLE_CLIENT_ZIP_FILE="NT_193000_client.zip"
+    $env:ORACLE_TEMP_CLIENT="C:\temp\oracle\client32"
+    $env:ORACLE_HOME="C:\oracle\Product\19.0.0\Client32"
+    $env:ORACLE_BASE="c:\oracle"
+    $env:ODP_NET="C:\oracle\Product\19.0.0\Client32\ODP.NET\bin\2.x"
+    #New-Item -Type Directory -Path "C:\Windows\assembly\GAC_32\Oracle.DataAccess\2.122.19.1__89b483f429c47342" -Force
+    #New-Item -Type Directory -Path ${env:ORACLE_TEMP} -Force
+    Get-Location;
+    Push-Location ${env:ORACLE_TEMP};
+    Get-Location;
+    Get-ChildItem;
+    #$current_http_proxy="$env:HTTP_PROXY"; 
+    #$current_https_proxy = "$env:HTTPS_PROXY"; 
+    #$url="${env:ORACLE_CLIENT_ZIP_FILE_LOCATION}${env:ORACLE_CLIENT_ZIP_FILE}";
+    #Write-Host $url;
+    #Invoke-WebRequest $url -OutFile ${env:ORACLE_CLIENT_ZIP_FILE} ;
+    #$env:HTTP_PROXY = $current_http_proxy; 
+    #$env:HTTPS_PROXY = $current_https_proxy; 
+    Expand-Archive -Path ${env:ORACLE_CLIENT_ZIP_FILE} -DestinationPath .; 
+    Get-ChildItem ;
+    # INSTALL ORACLE CLIENT
+    Set-Location ${env:ORACLE_TEMP_CLIENT}; 
+    Write-Output "INSTALING ORACLE DATABASE CLIENT VIA setup.exe process..."; 
+    Get-ChildItem ;
+    # See: https://silentinstallhq.com/oracle-database-19c-client-silent-install-how-to-guide/
+    Start-Process ${env:ORACLE_TEMP_CLIENT}\setup.exe -ArgumentList '-silent', '-nowait', '-ignoreSysPrereqs', '-ignorePrereqFailure', '-waitForCompletion', '-force', "ORACLE_HOME=${env:ORACLE_HOME}", "ORACLE_BASE=${env:ORACLE_BASE}", "oracle.install.IsBuiltInAccount=true", "oracle.install.client.installType=Runtime" -NoNewWindow -Wait; 
+    Write-Output "ORACLE DATABASE CLIENT INSTALLATION FINISHED."; 
+    # REGISTER CONFIG and GAC
+    Set-Location ${env:ODP_NET}; 
+    Write-Output "REGISTERING CONFIG AND GAG..."; 
+    .\OraProvCfg.exe /action:config  /force /product:odp /frameworkversion:v2.0.50727 /providerpath:"Oracle.DataAccess.dll"; 
+    .\OraProvCfg.exe /action:gac /providerpath:"Oracle.DataAccess.dll"; 
+    Set-Location C:\Windows\assembly\GAC_32\Oracle.DataAccess\2.122.19.1__89b483f429c47342\; 
+    Get-ChildItem -Filter *.dll -Recurse | Select-Object -ExpandProperty VersionInfo; 
+    Write-Output "CONFIG AND GAG REGISTER PROCESS FINISHED."; 
+    Set-Location ${env:ORACLE_HOME}; 
+    # SET ORACLE_HOME permissions (Avoid "System.Data.OracleClient requires Oracle client" exception)
+    $acl = Get-Acl ${env:ORACLE_HOME}; 
+    $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new( 
+        'Everyone', 
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, 
+        'ContainerInherit,ObjectInherit', 
+        [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow 
+    ); 
+    $acl.AddAccessRule($accessRule); 
+    Set-Acl ${env:ORACLE_HOME} $acl; 
+    Get-Acl ${env:ORACLE_HOME}; 
+    # ADD the ODAC install directory and ODAC install directory's bin subdirectory to the system PATH environment variable before any other Oracle directories.
+    $pathContent = [System.Environment]::GetEnvironmentVariable('PATH', [System.EnvironmentVariableTarget]::Machine); 
+    $pathContentBuilder = [System.Text.StringBuilder]::new(); 
+    $oracleHomeSegment = "${env:ORACLE_HOME};"; 
+    $pathContentBuilder.Append($oracleHomeSegment); 
+    $oracleBinPath = Join-Path -Path "${env:ORACLE_HOME}" -ChildPath "bin" -Resolve; 
+    $oracleBinPath += ';'; 
+    $pathContentBuilder.Append(${oracleBinPath}); 
+    $pathContentBuilder.Append(${pathContent}); 
+    [System.Environment]::SetEnvironmentVariable('PATH', $pathContentBuilder.ToString(), [System.EnvironmentVariableTarget]::Machine); 
+    # REMOVE install scripts and files
+    [System.IO.Path]::Combine($env:ORACLE_TEMP, '..') | Resolve-Path | Push-Location; 
+    [System.IO.Path]::Combine($env:ORACLE_TEMP, '*') | Remove-Item -Recurse -Force;
+    Pop-Location;
+    Write-Host "Oracle Client installed.";
+    
+  InstallPwshCore.ps1: |
+    Write-Host "Installing Powershell Core...";
+    Push-Location "C:\source";
+    Expand-Archive pwsCore.zip;
+    Start-Process msiexec -ArgumentList '/i', 'pwsCore\PowerShell-7.3.2-win-x64.msi', '/quiet' -Wait -PassThru;
+    Remove-Item pwsCore\PowerShell-7.3.2-win-x64.msi;
+    Pop-Location;
+    Write-Host "Powershell Core Installed.";
